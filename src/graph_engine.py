@@ -120,30 +120,105 @@ def extract_ink_and_paint(img_bgr: np.ndarray, sensitivity: float = 1.0) -> Tupl
     return ink, paint
 
 
+# ----------------------------------------------------------------------- page canvas & boundary
+def detect_page_canvas(img_bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """Detects the physical parchment/paper boundary against dark scanner beds, shadows, or scanner covers.
+    Returns (clean_img, page_bbox).
+    Only dark regions connected to the image outer borders with area > 0.005 * H * W are treated as scanner cradle.
+    """
+    H, W = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    is_dark = (gray < 45) & (img_bgr[:, :, 0] < 50) & (img_bgr[:, :, 1] < 50) & (img_bgr[:, :, 2] < 50)
+    if np.count_nonzero(is_dark) < 0.005 * H * W:
+        return img_bgr.copy(), (0, 0, W, H)
+
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(is_dark.astype(np.uint8) * 255)
+    bed_mask = np.zeros((H, W), dtype=np.uint8)
+    for i in range(1, n_lab):
+        x, y, w, h, a = stats[i]
+        touches_border = (x == 0 or y == 0 or x + w >= W or y + h >= H)
+        if touches_border and a > 0.005 * H * W:
+            bed_mask[labels == i] = 255
+
+    if np.count_nonzero(bed_mask) == 0:
+        return img_bgr.copy(), (0, 0, W, H)
+
+    bed_mask = cv2.morphologyEx(bed_mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    bed_mask = cv2.dilate(bed_mask, np.ones((11, 11), np.uint8))
+
+    parch_mask = (bed_mask == 0).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(parch_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        c = max(cnts, key=cv2.contourArea)
+        page_bbox = cv2.boundingRect(c)
+    else:
+        page_bbox = (0, 0, W, H)
+
+    parch_pixels = img_bgr[bed_mask == 0]
+    parch_color = np.median(parch_pixels, axis=0).astype(np.uint8) if len(parch_pixels) > 0 else np.array([210, 210, 210], dtype=np.uint8)
+
+    clean_img = img_bgr.copy()
+    clean_img[bed_mask > 0] = parch_color
+    return clean_img, page_bbox
+
+
 def extract_illustrations(paint: np.ndarray, m: float) -> List[Dict[str, Any]]:
-    """Detects contiguous watercolor illustration regions (plants, roots, drawings)
-    grouped into unified botanical clusters.
+    """Detects contiguous botanical drawings, large figures, and watercolor pigment clusters.
+    Unifies leaves, stems, flower heads, and roots into coherent botanical regions.
     """
     if paint is None or np.count_nonzero(paint) == 0:
         return []
-    close_k = max(9, int(round(2.5 * m)) | 1)
+    H, W = paint.shape[:2]
+
+    # Morphological closing with ellipse kernel scaled to glyph size to bridge leaves and stems
+    close_k = max(15, int(round(3.5 * m)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
     paint_closed = cv2.morphologyEx(paint, cv2.MORPH_CLOSE, kernel)
 
     n_lab, _, stats, _ = cv2.connectedComponentsWithStats(paint_closed, connectivity=8)
-    ills = []
+    raw_boxes = []
+    min_area = max(500, int(35 * m * m))
     for i in range(1, n_lab):
         area = stats[i, cv2.CC_STAT_AREA]
         pw = stats[i, cv2.CC_STAT_WIDTH]
         ph = stats[i, cv2.CC_STAT_HEIGHT]
         px = stats[i, cv2.CC_STAT_LEFT]
         py = stats[i, cv2.CC_STAT_TOP]
-        if area > 10 * m * m or (pw > 2.0 * m and ph > 2.0 * m and area > 5 * m * m):
-            ills.append({
-                'bbox': [int(px), int(py), int(pw), int(ph)],
-                'area': int(area),
-                'type': 'botanical_illustration'
-            })
+        if area > min_area or (pw > 5.0 * m and ph > 5.0 * m and area > 15 * m * m):
+            raw_boxes.append([px, py, px + pw, py + ph])
+
+    if not raw_boxes:
+        return []
+
+    # Merge overlapping or touching illustration bounding boxes
+    merged: List[List[int]] = []
+    for b in raw_boxes:
+        x0, y0, x1, y1 = b
+        pad = int(1.5 * m)
+        x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+        x1, y1 = min(W, x1 + pad), min(H, y1 + pad)
+
+        merged_with = -1
+        for mi, mb in enumerate(merged):
+            if not (x1 < mb[0] or x0 > mb[2] or y1 < mb[1] or y0 > mb[3]):
+                merged_with = mi
+                break
+        if merged_with >= 0:
+            mb = merged[merged_with]
+            merged[merged_with] = [min(mb[0], x0), min(mb[1], y0), max(mb[2], x1), max(mb[3], y1)]
+        else:
+            merged.append([x0, y0, x1, y1])
+
+    ills = []
+    for mb in merged:
+        bx0, by0, bx1, by1 = mb
+        bw, bh = bx1 - bx0, by1 - by0
+        ills.append({
+            'bbox': [int(bx0), int(by0), int(bw), int(bh)],
+            'area': int(bw * bh),
+            'type': 'botanical_illustration'
+        })
     return ills
 
 
@@ -168,10 +243,23 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
         p.update(params)
     H, W = img_bgr.shape[:2]
 
-    ink, paint = extract_ink_and_paint(img_bgr, p['sensitivity'])
+    # 1. Page canvas detection & dark scanner bed neutralization
+    clean_img, page_bbox = detect_page_canvas(img_bgr)
+    px0, py0, pw0, ph0 = page_bbox
+
+    # 2. Extract ink and paint from the sanitized page canvas
+    ink, paint = extract_ink_and_paint(clean_img, p['sensitivity'])
+
+    # Enforce boundary: Zero out ink/paint outside parchment contour
+    ink_mask_page = np.zeros((H, W), dtype=np.uint8)
+    ink_mask_page[py0:py0 + ph0, px0:px0 + pw0] = 255
+    ink = cv2.bitwise_and(ink, ink_mask_page)
+    paint = cv2.bitwise_and(paint, ink_mask_page)
+
     n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
     m = _estimate_scale(stats)
 
+    # 3. Detect unified illustrations
     illustrations = extract_illustrations(paint, m)
 
     def in_illustration(cx_val: float, cy_val: float) -> bool:
@@ -181,7 +269,10 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
                 return True
         return False
 
-    # ---- component filtering
+    # 4. Component filtering: drop sub-pixel dust, margin artifacts, and components inside illustrations
+    margin_x = max(int(0.025 * W), int(1.5 * m))
+    margin_y = max(int(0.025 * H), int(1.5 * m))
+
     x, y = stats[:, 0], stats[:, 1]
     w, h = stats[:, 2], stats[:, 3]
     area = stats[:, 4]
@@ -195,7 +286,7 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     keep_idx = []
     rejected_big = rejected_paint = 0
     for i in range(1, n_lab):
-        if area[i] < max(8, 0.05 * m * m) or h[i] < 6 or w[i] < 3:
+        if area[i] < max(8, 0.05 * m * m) or h[i] < 5 or w[i] < 2:
             continue
         if h[i] > p['max_component_height'] * m or w[i] > 9 * m:
             rejected_big += 1
@@ -207,10 +298,10 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
         comp_cy = y[i] + h[i] / 2.0
         if in_illustration(comp_cx, comp_cy):
             continue
-        # Discard extreme margin noise at scan boundary
-        if (x[i] < int(0.015 * W) or x[i] + w[i] > int(0.985 * W)) and (h[i] < 0.6 * m or w[i] < 0.6 * m):
+        # Discard outer margin noise
+        if comp_cx < px0 + margin_x or comp_cx > px0 + pw0 - margin_x:
             continue
-        if (y[i] < int(0.015 * H) or y[i] + h[i] > int(0.985 * H)) and (h[i] < 0.6 * m or w[i] < 0.6 * m):
+        if comp_cy < py0 + margin_y or comp_cy > py0 + ph0 - margin_y:
             continue
         keep_idx.append(i)
 
@@ -229,18 +320,17 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     if n < 3:
         return result
 
-    # ---- component graph (numpy, chunked)
+    # 5. Component graph (numpy, chunked DSU with tight vertical overlap)
     cx = (comps[:, 0] + comps[:, 2]) / 2.0
     cy = (comps[:, 1] + comps[:, 3]) / 2.0
     ch = (comps[:, 3] - comps[:, 1]).astype(float)
     dsu = _DSU(n)
-    max_gap = 2.5 * m
+    max_gap = 2.8 * m
     edges: List[Tuple[int, int]] = []
     order = np.argsort(comps[:, 0])
     cs = comps[order]
     for a in range(n):
         ia = order[a]
-        # candidates to the right within gap range (sorted by x0)
         hi = np.searchsorted(cs[:, 0], comps[ia, 2] + max_gap, side='right')
         if hi <= a + 1:
             continue
@@ -249,7 +339,7 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
 
         top_overlap = np.maximum(0, np.minimum(comps[cand, 3], comps[ia, 3]) - np.maximum(comps[cand, 1], comps[ia, 1]))
         min_h = np.minimum(ch[cand], ch[ia])
-        v_overlap = (top_overlap >= 0.18 * min_h)
+        v_overlap = (top_overlap >= 0.15 * min_h)
 
         dy = np.abs(cy[cand] - cy[ia])
         max_allowed_dy = 0.45 * np.maximum(m, min_h)
@@ -263,27 +353,80 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     for i in range(n):
         groups.setdefault(dsu.find(i), []).append(i)
 
-    # ---- line segments with text-likeness scoring
+    # 6. Line segments: filter out isolated margin dust (require length and components)
     segs: List[Dict[str, Any]] = []
+    assigned_comps: set = set()
     for ids in groups.values():
-        if len(ids) < p['min_line_components']:
-            continue
         b = comps[ids]
         bx, by, bw, bh = _union_bbox(b)
         heights = ch[ids]
         in_band = float(np.mean((heights >= 0.35 * m) & (heights <= 2.4 * m)))
-        aspect = min(1.0, (bw / max(bh, 1)) / 3.0)
-        size_term = min(1.0, len(ids) / 6.0)
+        aspect = min(1.0, (bw / max(bh, 1)) / 2.5)
+        size_term = min(1.0, len(ids) / 5.0)
         score = 0.45 * in_band + 0.3 * aspect + 0.25 * size_term
-        if score < p['min_text_score']:
+        if bw < 3.2 * m or len(ids) < p['min_line_components'] or score < p['min_text_score']:
             continue
-        segs.append({'ids': sorted(ids, key=lambda k: comps[k, 0]), 'bbox': [bx, by, bw, bh],
+        segs.append({'ids': set(ids), 'bbox': [bx, by, bw, bh],
                      'score': score, 'cy': float(cy[ids].mean())})
+        assigned_comps.update(ids)
+
     if not segs:
         return result
-    segs.sort(key=lambda s: (s['cy'], s['bbox'][0]))
 
-    # ---- word gap threshold (pooled gaps, Otsu)
+    # 7. Ascender / Descender Reassociation:
+    # Any component not yet assigned that sits vertically directly above or below a line
+    # within the line's horizontal span is attached to that line!
+    for i in range(n):
+        if i in assigned_comps:
+            continue
+        ci_cx, ci_cy = cx[i], cy[i]
+        best_seg = None
+        min_dist = 1.2 * m
+        for s in segs:
+            sbx, sby, sbw, sbh = s['bbox']
+            if sbx - 0.5 * m <= ci_cx <= sbx + sbw + 0.5 * m:
+                dy = abs(ci_cy - s['cy'])
+                if dy < min_dist:
+                    min_dist = dy
+                    best_seg = s
+        if best_seg is not None:
+            best_seg['ids'].add(i)
+            assigned_comps.add(i)
+
+    # Recompute line bboxes
+    final_segs: List[Dict[str, Any]] = []
+    for s in segs:
+        cids = sorted(list(s['ids']), key=lambda k: comps[k, 0])
+        b = comps[cids]
+        bx, by, bw, bh = _union_bbox(b)
+        final_segs.append({'ids': cids, 'bbox': [bx, by, bw, bh], 'score': s['score'], 'cy': float(cy[cids].mean())})
+    final_segs.sort(key=lambda s: (s['cy'], s['bbox'][0]))
+
+    # 8. Collinear line segment merging: Merge segments on the same baseline with horizontal gap <= 4.8 * m
+    ldsu = _DSU(len(final_segs))
+    for i in range(len(final_segs)):
+        bi = final_segs[i]['bbox']
+        for j in range(i + 1, len(final_segs)):
+            bj = final_segs[j]['bbox']
+            dy = abs(final_segs[j]['cy'] - final_segs[i]['cy'])
+            if dy <= 0.45 * m:
+                gap = max(bj[0] - (bi[0] + bi[2]), bi[0] - (bj[0] + bj[2]))
+                if gap <= 4.8 * m:
+                    ldsu.union(i, j)
+
+    merged_lines_map: Dict[int, List[int]] = {}
+    for i in range(len(final_segs)):
+        merged_lines_map.setdefault(ldsu.find(i), []).append(i)
+
+    segs = []
+    for seg_indices in merged_lines_map.values():
+        all_cids = sorted([cid for si in seg_indices for cid in final_segs[si]['ids']], key=lambda k: comps[k, 0])
+        b = comps[all_cids]
+        bx, by, bw, bh = _union_bbox(b)
+        segs.append({'ids': all_cids, 'bbox': [bx, by, bw, bh], 'cy': float(cy[all_cids].mean()), 'score': 1.0})
+    segs.sort(key=lambda s: s['cy'])
+
+    # 9. Word gap threshold (pooled gaps, Otsu)
     pooled: List[float] = []
     for s in segs:
         runmax = None
@@ -301,7 +444,7 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     thr = float(np.clip(thr, 0.28 * m, 0.75 * m)) * p['word_gap_scale']
     result['stats']['word_gap_threshold'] = thr
 
-    # ---- words
+    # 10. Individual word segmentation with internal split safeguard
     words: List[Dict[str, Any]] = []
     for si, s in enumerate(segs):
         cur: List[int] = []
@@ -354,65 +497,51 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
             words.append({'bbox': list(bb), 'seg': si, 'comps': cids, 'conf': conf})
             prev_gap = next_gap
 
-    # ---- blocks (paragraph-level)
+    # 11. Paragraph Block Clustering (Group vertically stacked lines into coherent blocks)
     sdsu = _DSU(len(segs))
     for i in range(len(segs)):
         bi = segs[i]['bbox']
         for j in range(i + 1, len(segs)):
             bj = segs[j]['bbox']
-            if bj[1] - (bi[1] + bi[3]) > 3.0 * m and segs[j]['cy'] - segs[i]['cy'] > 3.5 * m:
-                if segs[j]['cy'] - segs[i]['cy'] > 6 * m:
-                    break
+            if segs[j]['cy'] - segs[i]['cy'] > 3.5 * m:
+                break
             ox = min(bi[0] + bi[2], bj[0] + bj[2]) - max(bi[0], bj[0])
-            if ox <= 0.3 * min(bi[2], bj[2]):
+            if ox <= 0.20 * min(bi[2], bj[2]):
                 continue
-            vgap = bj[1] - (bi[1] + bi[3])
-            if vgap <= 1.6 * m and abs(segs[j]['cy'] - segs[i]['cy']) <= 3.2 * m:
-                sdsu.union(i, j)
+            sdsu.union(i, j)
+
     bgroups: Dict[int, List[int]] = {}
     for i in range(len(segs)):
         bgroups.setdefault(sdsu.find(i), []).append(i)
     blocks = []
-    for bi_, ids in enumerate(sorted(bgroups.values(), key=lambda g: (min(segs[k]['bbox'][1] for k in g),
-                                                                       min(segs[k]['bbox'][0] for k in g)))):
+    for bi_, ids in enumerate(sorted(bgroups.values(), key=lambda g: min(segs[k]['bbox'][1] for k in g))):
         bb = np.array([[segs[k]['bbox'][0], segs[k]['bbox'][1],
                         segs[k]['bbox'][0] + segs[k]['bbox'][2], segs[k]['bbox'][1] + segs[k]['bbox'][3]] for k in ids])
-        blocks.append({'segments': ids, 'bbox': list(_union_bbox(bb))})
+        blocks.append({'lines': ids, 'bbox': list(_union_bbox(bb))})
         for k in ids:
             segs[k]['block'] = bi_
 
-    # ---- logical lines (same baseline across figures / columns)
-    ldsu = _DSU(len(segs))
-    for i in range(len(segs)):
-        for j in range(i + 1, len(segs)):
-            if segs[j]['cy'] - segs[i]['cy'] > 0.62 * m:
-                break
-            bi, bj = segs[i]['bbox'], segs[j]['bbox']
-            if bi[0] + bi[2] <= bj[0] or bj[0] + bj[2] <= bi[0]:
-                ldsu.union(i, j)
-    lgroups: Dict[int, List[int]] = {}
-    for i in range(len(segs)):
-        lgroups.setdefault(ldsu.find(i), []).append(i)
-    logical = sorted(lgroups.values(), key=lambda g: np.mean([segs[k]['cy'] for k in g]))
-
-    # word ordering: logical line, then x
+    # 12. Natural Reading Order: Blocks top-to-bottom, lines top-to-bottom, words left-to-right
     word_ids_by_seg: Dict[int, List[int]] = {}
     for wi, wd in enumerate(words):
         word_ids_by_seg.setdefault(wd['seg'], []).append(wi)
+
     ll_out = []
     order_counter = 0
-    for li, seg_ids in enumerate(logical):
-        wids = [wi for k in seg_ids for wi in word_ids_by_seg.get(k, [])]
-        wids.sort(key=lambda wi: words[wi]['bbox'][0])
-        for wi in wids:
-            words[wi]['logical_line'] = li
-            words[wi]['order'] = order_counter
-            order_counter += 1
-        ll_out.append({'segments': seg_ids, 'word_ids': wids,
-                       'bbox': list(_union_bbox(np.array([[*words[wi]['bbox'][:2],
-                                                           words[wi]['bbox'][0] + words[wi]['bbox'][2],
-                                                           words[wi]['bbox'][1] + words[wi]['bbox'][3]] for wi in wids])))
-                       if wids else [0, 0, 0, 0]})
+    for bi_, blk in enumerate(blocks):
+        blk_seg_ids = sorted(blk['lines'], key=lambda si: segs[si]['cy'])
+        for li, si in enumerate(blk_seg_ids):
+            wids = word_ids_by_seg.get(si, [])
+            wids.sort(key=lambda wi: words[wi]['bbox'][0])
+            for wi in wids:
+                words[wi]['block'] = bi_
+                words[wi]['line_in_block'] = li
+                words[wi]['order'] = order_counter
+                order_counter += 1
+            if wids:
+                w_boxes = np.array([[*words[wi]['bbox'][:2], words[wi]['bbox'][0] + words[wi]['bbox'][2], words[wi]['bbox'][1] + words[wi]['bbox'][3]] for wi in wids])
+                ll_out.append({'segments': [si], 'word_ids': wids, 'bbox': list(_union_bbox(w_boxes)), 'block': bi_})
+
     for si, s in enumerate(segs):
         s['words'] = word_ids_by_seg.get(si, [])
 
