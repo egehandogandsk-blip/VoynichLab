@@ -286,7 +286,94 @@ def load_corpus(name: str) -> Optional[Dict[str, Any]]:
     if not os.path.exists(path):
         return None
     with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        corpus = json.load(f)
+
+    # Cross-platform dynamic path re-rooting
+    pages_dir = os.path.join(CORPUS_ROOT, name, 'pages')
+    for p in corpus.get('pages', []):
+        raw_img = p.get('image_path', '')
+        # Handle Windows and POSIX separators cleanly
+        fname = raw_img.replace('\\', '/').split('/')[-1] if raw_img else f"p{p.get('pdf_page', 1):04d}.png"
+        p['image_path'] = os.path.join(pages_dir, fname)
+
+    return corpus
+
+
+def ensure_page_image(corpus_name: str, page_entry: Dict[str, Any]) -> str:
+    """
+    Ensure the image file for a page entry exists on disk.
+    If missing, attempts to:
+    1. Render from the source PDF if available in data/uploads/
+    2. Fall back to a matching raw image in data/raw_images/{folio_id}.png
+    3. Generate a parchment placeholder image so that pipeline and UI never fail.
+    Returns the valid image path on disk.
+    """
+    pages_dir = os.path.join(CORPUS_ROOT, corpus_name, 'pages')
+    os.makedirs(pages_dir, exist_ok=True)
+
+    img_path = page_entry.get('image_path')
+    if not img_path:
+        fname = f"p{page_entry.get('pdf_page', 1):04d}.png"
+        img_path = os.path.join(pages_dir, fname)
+        page_entry['image_path'] = img_path
+    else:
+        fname = img_path.replace('\\', '/').split('/')[-1]
+        img_path = os.path.join(pages_dir, fname)
+        page_entry['image_path'] = img_path
+
+    if os.path.isfile(img_path) and os.path.getsize(img_path) > 0:
+        return img_path
+
+    # Strategy 1: Render on the fly from source PDF
+    corpus = load_corpus(corpus_name)
+    source_pdf = corpus.get('source_pdf') if corpus else f"{corpus_name}.pdf"
+    candidates = [
+        os.path.join(BASE_DIR, 'data', 'uploads', source_pdf),
+        os.path.join(BASE_DIR, 'data', 'uploads', f"{corpus_name}.pdf"),
+        os.path.join(BASE_DIR, 'data', 'uploads', 'voynich_manuscript.pdf'),
+    ]
+    for cpdf in candidates:
+        if os.path.isfile(cpdf):
+            try:
+                import fitz
+                doc = fitz.open(cpdf)
+                pdf_page_idx = int(page_entry.get('pdf_page', 1)) - 1
+                if 0 <= pdf_page_idx < len(doc):
+                    page = doc[pdf_page_idx]
+                    zoom = 1200 / max(1.0, page.rect.width)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                    pix.save(img_path)
+                    doc.close()
+                    return img_path
+                doc.close()
+            except Exception:
+                pass
+
+    # Strategy 2: Check matching folio in data/raw_images/
+    folio_id = page_entry.get('folio_id', '')
+    if folio_id:
+        for ext in ('.png', '.jpg', '.jpeg'):
+            raw_match = os.path.join(BASE_DIR, 'data', 'raw_images', f"{folio_id}{ext}")
+            if os.path.isfile(raw_match):
+                shutil.copyfile(raw_match, img_path)
+                return img_path
+
+    # Strategy 3: Generate clean parchment placeholder canvas
+    h, w = 1200, 850
+    canvas = np.full((h, w, 3), (205, 222, 235), dtype=np.uint8)  # Parchment tone
+    cv2.rectangle(canvas, (24, 24), (w - 24, h - 24), (140, 160, 180), 2)
+    cv2.rectangle(canvas, (32, 32), (w - 32, h - 32), (180, 195, 210), 1)
+
+    cv2.putText(canvas, "VOYNICH LAB // FOLIO TUVALI", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 50, 40), 2)
+    cv2.putText(canvas, f"Folio ID: {folio_id or 'Bilinmiyor'}", (50, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (30, 20, 15), 2)
+    cv2.putText(canvas, f"Bolum: {page_entry.get('section', '-')}", (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 70, 60), 2)
+    cv2.putText(canvas, f"PDF Sayfasi: {page_entry.get('pdf_page', '-')}", (50, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 90, 80), 1)
+
+    cv2.putText(canvas, "Sayfa gorseli diskte veya bulutta henuz render edilmedi.", (50, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120, 80, 50), 2)
+    cv2.putText(canvas, "Sol panelden PDF yukleyerek tam kulliyat goruntusunu olusturabilirsiniz.", (50, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 90, 80), 1)
+
+    cv2.imwrite(img_path, canvas)
+    return img_path
 
 
 def corpus_summary(corpus: Dict[str, Any]) -> Dict[str, Any]:

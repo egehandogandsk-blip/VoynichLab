@@ -20,7 +20,14 @@ sys.path.insert(0, base_dir)
 
 from src.vision_segmenter import load_image
 from src.pipeline import run_folio_analysis
-from src.pdf_corpus import build_corpus, list_corpora, load_corpus, corpus_summary
+from src.pdf_corpus import (
+    build_corpus, list_corpora, load_corpus, corpus_summary,
+    ensure_page_image, CORPUS_ROOT
+)
+from src.resource_manager import (
+    list_image_assets, rename_image_asset, replace_image_asset,
+    delete_image_asset, list_corpus_assets, rename_corpus_asset, delete_corpus_asset
+)
 from src.zl_corpus import load_zl, normalize_folio_id
 from src.slot_grammar import (
     parse_token, compare_grammars_on_tokens,
@@ -337,97 +344,253 @@ raw_img_dir = os.path.join(base_dir, "data", "raw_images")
 upload_dir = os.path.join(base_dir, "data", "uploads")
 os.makedirs(upload_dir, exist_ok=True)
 
-source_mode = st.sidebar.radio("Calisma Modu:", ["Tek Sayfa / Ornek Folio", "Tam PDF Kulliyati"])
+mode_options = ["Tek Sayfa / Ornek Folio", "Tam PDF Kulliyati"]
+current_mode_idx = 0
+if st.session_state.get("source_mode") in mode_options:
+    current_mode_idx = mode_options.index(st.session_state["source_mode"])
+
+source_mode = st.sidebar.radio(
+    "Calisma Modu:",
+    mode_options,
+    index=current_mode_idx,
+    key="source_mode_radio"
+)
+st.session_state["source_mode"] = source_mode
 
 active_corpus = None
 active_page_meta = None
 
 if source_mode == "Tek Sayfa / Ornek Folio":
-    selected_label = st.sidebar.selectbox("Katalog Sayfasi Sec:", list(FOLIO_PRESETS.keys()))
-    folio_code = FOLIO_PRESETS[selected_label]
-    
-    with st.sidebar.expander("Ozel Gorsel Yukle (PNG/JPG)", expanded=False):
-        custom_upload = st.file_uploader("Yerel Gorsel Dosyasi:", type=["png", "jpg", "jpeg"])
-        
-    if custom_upload is not None:
-        temp_img_path = os.path.join(raw_img_dir, "temp_custom.png")
-        with open(temp_img_path, "wb") as f:
-            f.write(custom_upload.read())
-        active_image_path = temp_img_path
-        active_folio_id = "custom"
-    else:
-        active_image_path = os.path.join(raw_img_dir, f"{folio_code}.png")
-        active_folio_id = folio_code
+    all_imgs = list_image_assets(raw_img_dir)
+    img_names = [x["filename"] for x in all_imgs] if all_imgs else ["f11r.png"]
+
+    def format_img_label(fn: str) -> str:
+        fid = os.path.splitext(fn)[0]
+        preset_notes = {
+            "f11r": "Silene Acaulis / Rozet Mavi Cicek",
+            "f11v": "Leonotus / Cift Kolonlu Govde",
+            "f16r": "Cannabis / Kenevir Bitkisi",
+            "f18r": "Cyanus / Mavi Cicek, Kirmizi Merkez",
+        }
+        if fid in preset_notes:
+            return f"{fid} ({preset_notes[fid]})"
+        return fn
+
+    cur_sel_img = st.session_state.get("selected_folio_img")
+    default_img_idx = 0
+    if cur_sel_img and cur_sel_img in img_names:
+        default_img_idx = img_names.index(cur_sel_img)
+    elif "f11r.png" in img_names:
+        default_img_idx = img_names.index("f11r.png")
+
+    selected_filename = st.sidebar.selectbox(
+        "Aktif Folio Gorseli Sec:",
+        img_names,
+        index=default_img_idx,
+        format_func=format_img_label,
+        key="sb_selected_folio_img"
+    )
+    st.session_state["selected_folio_img"] = selected_filename
+    active_image_path = os.path.join(raw_img_dir, selected_filename)
+    active_folio_id = os.path.splitext(selected_filename)[0]
+
 else:
-    with st.sidebar.expander("Yeni PDF Kulliyati Yukle", expanded=False):
-        pdf_upload = st.file_uploader("Voynich PDF Dosyasi:", type=["pdf"])
-        start_folio = st.number_input("Ilk Folio No:", min_value=1, max_value=116, value=1)
-        start_side = st.selectbox("Ilk Sayfa Yuzu:", ["r (recto)", "v (verso)"])[0]
-        page_offset = st.number_input("Atlanacak Kapak Sayfasi:", min_value=0, max_value=50, value=0)
-        
-        if pdf_upload is not None and st.button("PDF Ayristir ve Kulliyat Olustur", use_container_width=True):
-            pdf_path = os.path.join(upload_dir, pdf_upload.name)
-            with open(pdf_path, "wb") as f:
-                f.write(pdf_upload.getbuffer())
-            bar = st.progress(0.0, text="Ayristirma suruyor...")
-            preview_placeholder = st.empty()
-
-            def on_progress(p, msg, img_path=None):
-                bar.progress(min(p, 1.0), text=msg)
-                if img_path and os.path.exists(img_path):
-                    preview_placeholder.image(img_path, caption=f"Analiz Edilen: {os.path.basename(img_path)}", use_container_width=True)
-
-            corpus_obj = build_corpus(
-                pdf_path, pdf_upload.name, start_folio=int(start_folio), start_side=start_side,
-                page_offset=int(page_offset), progress_cb=on_progress
-            )
-            st.session_state["active_corpus_name"] = corpus_obj["name"]
-            st.success(f"{len(corpus_obj['pages'])} sayfa kulliyata kaydedildi.")
-
     corpora = list_corpora()
     if not corpora:
-        st.info("Kayitli kulliyat bulunamadi. Sol panelden bir PDF yukleyin veya 'Tek Sayfa' moduna gecin.")
-        st.stop()
-    default_idx = corpora.index(st.session_state["active_corpus_name"]) if st.session_state.get("active_corpus_name") in corpora else 0
-    corpus_name = st.sidebar.selectbox("Kayitli Kulliyat:", corpora, index=default_idx)
-    active_corpus = load_corpus(corpus_name)
-    pages = active_corpus["pages"]
-    page_labels = [f"{p['folio_id']} - {p['section']}" for p in pages]
-    sel_idx = st.sidebar.selectbox("Incelenecek Folio:", range(len(pages)), format_func=lambda i: page_labels[i])
-    active_page_meta = pages[sel_idx]
-    active_image_path = active_page_meta["image_path"]
-    active_folio_id = active_page_meta["folio_id"]
+        st.sidebar.info("Kayitli kulliyat bulunamadi. Asagidaki 'Dosya Yoneticisi'nden yeni bir PDF yukleyebilirsiniz.")
+        # Provide fallback to avoid breaking layout
+        all_imgs = list_image_assets(raw_img_dir)
+        fallback_fn = all_imgs[0]["filename"] if all_imgs else "f11r.png"
+        active_image_path = os.path.join(raw_img_dir, fallback_fn)
+        active_folio_id = os.path.splitext(fallback_fn)[0]
+    else:
+        default_idx = corpora.index(st.session_state["active_corpus_name"]) if st.session_state.get("active_corpus_name") in corpora else 0
+        corpus_name = st.sidebar.selectbox("Kayitli Kulliyat:", corpora, index=default_idx, key="sb_corpus_name")
+        active_corpus = load_corpus(corpus_name)
+        pages = active_corpus.get("pages", [])
+        if not pages:
+            st.sidebar.warning("Secili kulliyatta sayfa bulunamadi.")
+            st.stop()
+        page_labels = [f"{p['folio_id']} - {p.get('section', '-')}" for p in pages]
+        sel_idx = st.sidebar.selectbox("Incelenecek Folio:", range(len(pages)), format_func=lambda i: page_labels[i], key="sb_page_idx")
+        active_page_meta = pages[sel_idx]
+        active_image_path = ensure_page_image(corpus_name, active_page_meta)
+        active_folio_id = active_page_meta.get("folio_id", "f1r")
 
-# Sidebar Kaynak Yonetimi (Degistir / Sil)
-with st.sidebar.popover("Kaynak Yonetimi (Degistir / Sil)", use_container_width=True):
-    st.markdown(f"**Aktif Kaynak:** `{active_folio_id}`")
-    st.caption(f"Dosya: `{os.path.basename(active_image_path)}`")
-    st.markdown("---")
-    st.markdown("**Kaynak Degistir:**")
-    replace_file = st.file_uploader("Yerine Yeni Dosya Yukle:", type=["png", "jpg", "jpeg", "pdf"], key="replace_file_uploader")
-    if replace_file is not None and st.button("Dosyayi Degistir ve Guncelle", use_container_width=True):
-        if replace_file.name.lower().endswith(".pdf"):
-            r_pdf_path = os.path.join(upload_dir, replace_file.name)
-            with open(r_pdf_path, "wb") as f:
-                f.write(replace_file.getbuffer())
-            new_c = build_corpus(r_pdf_path, replace_file.name)
-            st.session_state["active_corpus_name"] = new_c["name"]
-        else:
-            cust_p = os.path.join(raw_img_dir, "temp_custom.png")
-            with open(cust_p, "wb") as f:
-                f.write(replace_file.getbuffer())
-        st.rerun()
-    st.markdown("---")
-    st.markdown("**Kaynak Sil:**")
-    if st.button("Aktif Ozel Kaynagi Sil", use_container_width=True):
-        cust_p = os.path.join(raw_img_dir, "temp_custom.png")
-        if os.path.exists(cust_p):
-            try:
-                os.remove(cust_p)
-            except Exception:
-                pass
-        st.session_state.pop("active_corpus_name", None)
-        st.rerun()
+# ==============================================================================
+# DOSYA VE KAYNAK YONETICISI (KART YAPISI TEMELINDE MODUL)
+# ==============================================================================
+st.sidebar.markdown('<div class="sidebar-section-title">DOSYA VE KAYNAK YONETICISI</div>', unsafe_allow_html=True)
+with st.sidebar.expander("Dosya ve Kaynak Yoneticisi", expanded=False):
+    tab_mgr_img, tab_mgr_pdf, tab_mgr_new = st.tabs(["Tek Sayfa / Folio", "PDF Kulliyatlari", "Yeni Kaynak"])
+
+    # ----------------- Kategori 1: Tek Sayfa / Folio Kartlari -----------------
+    with tab_mgr_img:
+        all_imgs = list_image_assets(raw_img_dir)
+        st.caption(f"Toplam {len(all_imgs)} tek sayfa / folio gorseli kayitli.")
+        for img_info in all_imgs:
+            fn = img_info["filename"]
+            fid = img_info["folio_id"]
+            is_active = (source_mode == "Tek Sayfa / Ornek Folio" and active_folio_id == fid)
+
+            with st.container(border=True):
+                badge_type = "Katalog" if img_info["is_catalog"] else "Ozel"
+                badge_color = "#1e3a5f" if img_info["is_catalog"] else "#2d3748"
+                status_badge = "<span style='background:#10b981; color:#fff; padding:2px 6px; border-radius:3px; font-size:0.7rem;'>AKTIF</span>" if is_active else f"<span style='background:{badge_color}; color:#d1d5db; padding:2px 6px; border-radius:3px; font-size:0.7rem;'>{badge_type}</span>"
+
+                st.markdown(f"**`{fn}`** {status_badge}", unsafe_allow_html=True)
+                st.caption(f"Cozunurluk: {img_info['width']}x{img_info['height']} px | Boyut: {img_info['size_str']}")
+
+                col_a1, col_a2 = st.columns([1, 1])
+                with col_a1:
+                    if st.button("Aktif Yap", key=f"btn_act_{fn}", disabled=is_active, use_container_width=True):
+                        st.session_state["selected_folio_img"] = fn
+                        st.session_state["source_mode"] = "Tek Sayfa / Ornek Folio"
+                        st.rerun()
+                with col_a2:
+                    with st.popover("Duzenle", use_container_width=True):
+                        st.markdown(f"**`{fn}` Islemleri**")
+                        # Rename
+                        st.caption("1. Isim Degistir:")
+                        new_f_name = st.text_input("Yeni Folio Adi:", value=fid, key=f"ren_txt_{fn}")
+                        if st.button("Ismi Kaydet", key=f"btn_ren_{fn}", use_container_width=True):
+                            ok, msg, new_fn = rename_image_asset(fn, new_f_name, raw_img_dir)
+                            if ok:
+                                if st.session_state.get("selected_folio_img") == fn:
+                                    st.session_state["selected_folio_img"] = new_fn
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+                        st.markdown("---")
+                        # Replace
+                        st.caption("2. Kaynak Replace Et:")
+                        rep_up = st.file_uploader("Yeni Gorsel Yukle:", type=["png", "jpg", "jpeg"], key=f"rep_up_{fn}")
+                        if rep_up and st.button("Gorseli Degistir", key=f"btn_rep_{fn}", use_container_width=True):
+                            ok, msg = replace_image_asset(fn, rep_up.getbuffer(), raw_img_dir)
+                            if ok:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+                        st.markdown("---")
+                        # Delete
+                        st.caption("3. Kaynak Sil:")
+                        if st.button("Dosyayi Sil", key=f"btn_del_{fn}", use_container_width=True):
+                            ok, msg = delete_image_asset(fn, raw_img_dir)
+                            if ok:
+                                if st.session_state.get("selected_folio_img") == fn:
+                                    st.session_state.pop("selected_folio_img", None)
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+    # ----------------- Kategori 2: PDF Kulliyatlari Kartlari -----------------
+    with tab_mgr_pdf:
+        all_corpora = list_corpus_assets(CORPUS_ROOT, upload_dir)
+        st.caption(f"Toplam {len(all_corpora)} PDF kulliyati kayitli.")
+        for corp_info in all_corpora:
+            cname = corp_info["name"]
+            is_active = (source_mode == "Tam PDF Kulliyati" and active_corpus and active_corpus.get("name") == cname)
+
+            with st.container(border=True):
+                status_badge = "<span style='background:#10b981; color:#fff; padding:2px 6px; border-radius:3px; font-size:0.7rem;'>AKTIF</span>" if is_active else "<span style='background:#374151; color:#d1d5db; padding:2px 6px; border-radius:3px; font-size:0.7rem;'>KULLIYAT</span>"
+
+                st.markdown(f"**`{cname}`** {status_badge}", unsafe_allow_html=True)
+                st.caption(f"Sayfa: {corp_info['total_pages']} | PDF: `{corp_info['source_pdf']}` ({corp_info['pdf_size_str']})")
+                st.caption(f"Onbellek: {corp_info['rendered_pages']}/{corp_info['total_pages']} sayfa render edildi")
+
+                col_c1, col_c2 = st.columns([1, 1])
+                with col_c1:
+                    if st.button("Aktif Yap", key=f"btn_act_corp_{cname}", disabled=is_active, use_container_width=True):
+                        st.session_state["active_corpus_name"] = cname
+                        st.session_state["source_mode"] = "Tam PDF Kulliyati"
+                        st.rerun()
+                with col_c2:
+                    with st.popover("Duzenle", use_container_width=True):
+                        st.markdown(f"**`{cname}` Islemleri**")
+                        # Rename
+                        st.caption("1. Kulliyat Ismini Degistir:")
+                        new_c_name = st.text_input("Yeni Kulliyat Adi:", value=cname, key=f"ren_corp_txt_{cname}")
+                        if st.button("Ismi Kaydet", key=f"btn_ren_corp_{cname}", use_container_width=True):
+                            ok, msg, final_cname = rename_corpus_asset(cname, new_c_name, CORPUS_ROOT)
+                            if ok:
+                                if st.session_state.get("active_corpus_name") == cname:
+                                    st.session_state["active_corpus_name"] = final_cname
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+                        st.markdown("---")
+                        # Replace PDF & re-render
+                        st.caption("2. PDF Replace Et:")
+                        rep_pdf = st.file_uploader("Yeni PDF Dosyasi:", type=["pdf"], key=f"rep_pdf_up_{cname}")
+                        if rep_pdf and st.button("PDF ile Yeniden Olustur", key=f"btn_rep_pdf_{cname}", use_container_width=True):
+                            n_pdf_path = os.path.join(upload_dir, rep_pdf.name)
+                            with open(n_pdf_path, "wb") as f:
+                                f.write(rep_pdf.getbuffer())
+                            with st.spinner("Kulliyat yeniden taranip olusturuluyor..."):
+                                new_c = build_corpus(n_pdf_path, cname)
+                            st.session_state["active_corpus_name"] = new_c["name"]
+                            st.success("Kulliyat basariyla yenilendi.")
+                            st.rerun()
+
+                        st.markdown("---")
+                        # Delete
+                        st.caption("3. Kulliyati Sil:")
+                        if st.button("Kulliyati Sil", key=f"btn_del_corp_{cname}", use_container_width=True):
+                            ok, msg = delete_corpus_asset(cname, CORPUS_ROOT, upload_dir)
+                            if ok:
+                                if st.session_state.get("active_corpus_name") == cname:
+                                    st.session_state.pop("active_corpus_name", None)
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+    # ----------------- Kategori 3: Yeni Kaynak Ekle -----------------
+    with tab_mgr_new:
+        st.markdown("**1. Tek Sayfa / Folio Gorseli Ekle**")
+        new_single_img = st.file_uploader("Folio Gorseli Yukle (PNG/JPG):", type=["png", "jpg", "jpeg"], key="uploader_new_single")
+        new_single_name = st.text_input("Ozel Folio Kodu / Ismi (opsiyonel):", key="txt_new_single_name", placeholder="ornek: f20r")
+        if new_single_img and st.button("Gorseli Kutuphaneye Ekle", use_container_width=True, key="btn_save_new_single"):
+            ext = os.path.splitext(new_single_img.name)[1].lower()
+            target_fname = f"{new_single_name.strip()}{ext}" if new_single_name.strip() else new_single_img.name
+            target_path = os.path.join(raw_img_dir, target_fname)
+            with open(target_path, "wb") as f:
+                f.write(new_single_img.getbuffer())
+            st.session_state["selected_folio_img"] = target_fname
+            st.session_state["source_mode"] = "Tek Sayfa / Ornek Folio"
+            st.success(f"'{target_fname}' kutuphaneye eklendi.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("**2. Yeni PDF Kulliyati Yukle ve Ayristir**")
+        new_mgr_pdf = st.file_uploader("Kulliyat PDF Dosyasi:", type=["pdf"], key="uploader_new_mgr_pdf")
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            mgr_start_f = st.number_input("Baslangic Folio:", min_value=1, max_value=116, value=1, key="mgr_sf")
+            mgr_offset = st.number_input("Kapak Atlama:", min_value=0, max_value=50, value=0, key="mgr_off")
+        with col_p2:
+            mgr_side = st.selectbox("Baslangic Yuzu:", ["r (recto)", "v (verso)"], key="mgr_sd")[0]
+        if new_mgr_pdf and st.button("Kulliyati Incele ve Kaydet", use_container_width=True, key="btn_build_new_mgr_pdf"):
+            saved_pdf_path = os.path.join(upload_dir, new_mgr_pdf.name)
+            with open(saved_pdf_path, "wb") as f:
+                f.write(new_mgr_pdf.getbuffer())
+            with st.spinner("PDF sayfalari ayristiriliyor ve kulliyat olusturuluyor..."):
+                c_obj = build_corpus(
+                    saved_pdf_path, new_mgr_pdf.name,
+                    start_folio=int(mgr_start_f), start_side=mgr_side,
+                    page_offset=int(mgr_offset)
+                )
+            st.session_state["active_corpus_name"] = c_obj["name"]
+            st.session_state["source_mode"] = "Tam PDF Kulliyati"
+            st.success(f"{len(c_obj['pages'])} sayfa basariyla olusturuldu.")
+            st.rerun()
 
 st.sidebar.markdown("---")
 

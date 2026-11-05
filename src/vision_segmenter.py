@@ -11,11 +11,27 @@ from typing import List, Tuple, Dict, Any
 
 
 def load_image(image_path: str) -> np.ndarray:
-    """Load image safely from disk and return BGR image array."""
+    """
+    Safely load image from disk and return BGR image array.
+    If file is missing or unreadable, creates and returns a parchment placeholder array.
+    """
+    import os
+    if not image_path or not os.path.isfile(image_path):
+        h, w = 1000, 750
+        fallback = np.full((h, w, 3), (205, 222, 235), dtype=np.uint8)
+        cv2.rectangle(fallback, (15, 15), (w - 15, h - 15), (140, 160, 180), 2)
+        text = os.path.basename(image_path) if image_path else "Bilinmeyen"
+        cv2.putText(fallback, f"Gorsel Bulunamadi: {text}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 40, 30), 2)
+        return fallback
+
     img = cv2.imread(image_path)
     if img is None:
-        pil_img = Image.open(image_path).convert('RGB')
-        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        try:
+            pil_img = Image.open(image_path).convert('RGB')
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception:
+            h, w = 1000, 750
+            img = np.full((h, w, 3), (205, 222, 235), dtype=np.uint8)
     return img
 
 
