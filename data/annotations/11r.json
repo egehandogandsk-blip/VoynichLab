@@ -1,0 +1,22 @@
+{
+  "folio": "11r",
+  "word_annotations": {
+    "0": {
+      "reading": "daiin",
+      "meaning": "yaprak (folium)",
+      "pos": "İsim",
+      "slot": {},
+      "notes": "Tekrar eden yaprak formülü",
+      "confidence": 4
+    }
+  },
+  "token_annotations": {
+    "daiin": {
+      "meaning": "yaprak (folium)",
+      "pos": "İsim",
+      "notes": "Tekrar eden yaprak formülü"
+    }
+  },
+  "folio_notes": "",
+  "hypothesis_author": "Kriptolog"
+}

@@ -1,0 +1,29 @@
+﻿# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Streamlit Local Cache & Config
+.streamlit/secrets.toml
+
+# Heavy dynamic data (PDF uploads & rendered corpus page images)
+data/uploads/*
+!data/uploads/.gitkeep
+data/corpus/*/pages/
+data/raw_images/temp_*.png
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
