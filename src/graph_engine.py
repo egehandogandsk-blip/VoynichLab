@@ -121,8 +121,16 @@ def extract_ink_and_paint(img_bgr: np.ndarray, sensitivity: float = 1.0) -> Tupl
 
 
 def extract_illustrations(paint: np.ndarray, m: float) -> List[Dict[str, Any]]:
-    """Detects large contiguous watercolor illustration regions (plants, roots, drawings)."""
-    n_lab, _, stats, _ = cv2.connectedComponentsWithStats(paint, connectivity=8)
+    """Detects contiguous watercolor illustration regions (plants, roots, drawings)
+    grouped into unified botanical clusters.
+    """
+    if paint is None or np.count_nonzero(paint) == 0:
+        return []
+    close_k = max(9, int(round(2.5 * m)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    paint_closed = cv2.morphologyEx(paint, cv2.MORPH_CLOSE, kernel)
+
+    n_lab, _, stats, _ = cv2.connectedComponentsWithStats(paint_closed, connectivity=8)
     ills = []
     for i in range(1, n_lab):
         area = stats[i, cv2.CC_STAT_AREA]
@@ -130,7 +138,7 @@ def extract_illustrations(paint: np.ndarray, m: float) -> List[Dict[str, Any]]:
         ph = stats[i, cv2.CC_STAT_HEIGHT]
         px = stats[i, cv2.CC_STAT_LEFT]
         py = stats[i, cv2.CC_STAT_TOP]
-        if area > 12 * m * m or (pw > 2.5 * m and ph > 2.5 * m and area > 6 * m * m):
+        if area > 10 * m * m or (pw > 2.0 * m and ph > 2.0 * m and area > 5 * m * m):
             ills.append({
                 'bbox': [int(px), int(py), int(pw), int(ph)],
                 'area': int(area),
@@ -140,11 +148,16 @@ def extract_illustrations(paint: np.ndarray, m: float) -> List[Dict[str, Any]]:
 
 
 def _estimate_scale(stats: np.ndarray) -> float:
+    if stats.shape[0] <= 1:
+        return 14.0
     h = stats[1:, cv2.CC_STAT_HEIGHT]
     a = stats[1:, cv2.CC_STAT_AREA]
-    sel = h[(h >= 6) & (h <= 80) & (a >= 20)]
-    if sel.size < 8:
-        return 14.0
+    w = stats[1:, cv2.CC_STAT_WIDTH]
+    sel = h[(h >= 8) & (h <= 75) & (a >= 20) & (w >= 3)]
+    if sel.size < 6:
+        sel = h[(h >= 5) & (h <= 80)]
+        if sel.size < 4:
+            return 14.0
     return float(np.median(sel))
 
 
@@ -158,6 +171,15 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     ink, paint = extract_ink_and_paint(img_bgr, p['sensitivity'])
     n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
     m = _estimate_scale(stats)
+
+    illustrations = extract_illustrations(paint, m)
+
+    def in_illustration(cx_val: float, cy_val: float) -> bool:
+        for ill in illustrations:
+            bx, by, bw, bh = ill['bbox']
+            if bx <= cx_val <= bx + bw and by <= cy_val <= by + bh:
+                return True
+        return False
 
     # ---- component filtering
     x, y = stats[:, 0], stats[:, 1]
@@ -173,15 +195,17 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     keep_idx = []
     rejected_big = rejected_paint = 0
     for i in range(1, n_lab):
-        if area[i] < max(4, 0.02 * m * m):
+        if area[i] < max(8, 0.05 * m * m) or h[i] < 6 or w[i] < 3:
             continue
         if h[i] > p['max_component_height'] * m or w[i] > 9 * m:
             rejected_big += 1
             continue
-        if h[i] < 0.18 * m and w[i] < 0.5 * m:
-            continue
         if paint_frac(i) > p['paint_reject']:
             rejected_paint += 1
+            continue
+        comp_cx = x[i] + w[i] / 2.0
+        comp_cy = y[i] + h[i] / 2.0
+        if in_illustration(comp_cx, comp_cy):
             continue
         # Discard extreme margin noise at scan boundary
         if (x[i] < int(0.015 * W) or x[i] + w[i] > int(0.985 * W)) and (h[i] < 0.6 * m or w[i] < 0.6 * m):
@@ -193,8 +217,6 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     comps = np.array([[x[i], y[i], x[i] + w[i], y[i] + h[i]] for i in keep_idx], dtype=np.int32) \
         if keep_idx else np.zeros((0, 4), dtype=np.int32)
     n = len(comps)
-
-    illustrations = extract_illustrations(paint, m)
 
     result: Dict[str, Any] = {
         'image_size': [W, H], 'm': m, 'params': p,
@@ -212,8 +234,7 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
     cy = (comps[:, 1] + comps[:, 3]) / 2.0
     ch = (comps[:, 3] - comps[:, 1]).astype(float)
     dsu = _DSU(n)
-    max_gap = 4.2 * m
-    max_dy = 0.92 * m
+    max_gap = 2.5 * m
     edges: List[Tuple[int, int]] = []
     order = np.argsort(comps[:, 0])
     cs = comps[order]
@@ -225,9 +246,15 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
             continue
         cand = order[a + 1:hi]
         gap = comps[cand, 0] - comps[ia, 2]
+
+        top_overlap = np.maximum(0, np.minimum(comps[cand, 3], comps[ia, 3]) - np.maximum(comps[cand, 1], comps[ia, 1]))
+        min_h = np.minimum(ch[cand], ch[ia])
+        v_overlap = (top_overlap >= 0.18 * min_h)
+
         dy = np.abs(cy[cand] - cy[ia])
-        ratio = np.maximum(ch[cand], ch[ia]) / np.maximum(np.minimum(ch[cand], ch[ia]), 1)
-        ok = (dy <= max_dy) & (ratio <= 6.0) & (gap <= max_gap)
+        max_allowed_dy = 0.45 * np.maximum(m, min_h)
+
+        ok = v_overlap & (dy <= max_allowed_dy) & (gap >= -0.3 * m) & (gap <= max_gap)
         for j in cand[ok]:
             dsu.union(ia, int(j))
             edges.append((ia, int(j)))
@@ -267,11 +294,11 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
                     pooled.append(float(g))
             runmax = comps[k, 2] if runmax is None else max(runmax, comps[k, 2])
     pooled_arr = np.clip(np.array(pooled), 0, 2.5 * m) if pooled else np.array([])
-    if pooled_arr.size >= 20:
+    if pooled_arr.size >= 15:
         thr = _otsu_1d(pooled_arr)
     else:
-        thr = 0.45 * m
-    thr = float(np.clip(thr, 0.15 * m, 0.9 * m)) * p['word_gap_scale']
+        thr = 0.42 * m
+    thr = float(np.clip(thr, 0.28 * m, 0.75 * m)) * p['word_gap_scale']
     result['stats']['word_gap_threshold'] = thr
 
     # ---- words
@@ -289,10 +316,36 @@ def analyze_layout(img_bgr: np.ndarray, params: Optional[Dict[str, Any]] = None)
                 gaps_in.append(max(0.0, float(comps[k, 0] - runmax)))
             cur.append(k)
             runmax = comps[k, 2] if runmax is None else max(runmax, comps[k, 2])
-        pending.append((cur, gaps_in, float('inf')))
+        if cur:
+            pending.append((cur, gaps_in, float('inf')))
+
         prev_gap = float('inf')
         for cids, gin, next_gap in pending:
+            if not cids:
+                continue
             bb = _union_bbox(comps[cids])
+
+            # Safeguard against multi-word agglomerations
+            if bb[2] > 4.8 * m and len(cids) > 1:
+                sub_cur = [cids[0]]
+                sub_runmax = comps[cids[0], 2]
+                sub_words_cids = []
+                for cid in cids[1:]:
+                    cg = comps[cid, 0] - sub_runmax
+                    if cg > 0.25 * m:
+                        sub_words_cids.append(sub_cur)
+                        sub_cur = [cid]
+                    else:
+                        sub_cur.append(cid)
+                    sub_runmax = max(sub_runmax, comps[cid, 2])
+                if sub_cur:
+                    sub_words_cids.append(sub_cur)
+
+                for sc in sub_words_cids:
+                    sbb = _union_bbox(comps[sc])
+                    words.append({'bbox': list(sbb), 'seg': si, 'comps': sc, 'conf': 0.85})
+                continue
+
             bound = min(prev_gap, next_gap)
             bound_conf = 0.5 if bound == float('inf') else float(np.clip(bound / thr, 1, 3) / 3 + 0.17)
             inner = max(gin) if gin else 0.0
